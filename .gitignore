@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+llm_state.json
+frontend/node_modules/
+frontend/dist/
+.DS_Store
