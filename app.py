@@ -18,7 +18,8 @@ from export_dashboard import main as export_live_dashboard
 
 # Local development opts in via .env: APP_MODE=local.
 # Streamlit Cloud defaults safely to live/read-only because .env is not committed.
-load_dotenv()
+ROOT_DIR = Path(__file__).resolve().parent
+load_dotenv(ROOT_DIR / ".env")
 APP_MODE = os.getenv("APP_MODE", "live").strip().lower()
 IS_LIVE = APP_MODE == "live"
 

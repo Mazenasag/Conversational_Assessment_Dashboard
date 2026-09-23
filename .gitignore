@@ -1,8 +1,22 @@
+# Secrets / local configuration
 .env
+
+# Python environment and bytecode
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+
+# Runtime state
 llm_state.json
+
+# Frontend build dependencies (if used later)
 frontend/node_modules/
 frontend/dist/
+
+# OS / editor noise
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/

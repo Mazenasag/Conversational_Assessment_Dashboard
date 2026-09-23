@@ -26,12 +26,14 @@ Important:
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
 
-load_dotenv()
+ROOT_DIR = Path(__file__).resolve().parent
+load_dotenv(ROOT_DIR / ".env")
 
 DEFAULT_MODEL = os.getenv(
     "GEMINI_MODEL",
