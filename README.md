@@ -9,7 +9,7 @@ Raw weekly Excel upload (local Streamlit)
         ↓
 processor.py — deterministic reconstruction
         ↓
-processor_with_classes.py — Adelaide class assignment
+processor_with_classes.py 
         ↓
 processor_groq.py — cached/new Gemini semantic enrichment
         ↓
