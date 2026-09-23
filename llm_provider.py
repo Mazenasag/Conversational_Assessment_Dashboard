@@ -1,228 +1,51 @@
-
 """
 llm_provider.py
 
-Checkpoint-safe Google Gemini provider.
+Provider-agnostic LLM layer for the Conversational Assessment Dashboard.
 
-Required packages:
-    google-genai
-    python-dotenv
+Supported providers:
+    gemini
+    openai
+    groq
+    together
+    openai_compatible
+    anthropic
 
-Install:
-    pip install -U google-genai python-dotenv
+Recommended .env:
+    APP_MODE=local
+    LLM_PROVIDER=gemini
+    LLM_API_KEY=your_key_here
+    LLM_MODEL=gemini-3.5-flash-lite
 
-.env:
-    GEMINI_API_KEY=your_key_here
+Optional for custom OpenAI-compatible services:
+    LLM_BASE_URL=https://your-provider.example/v1
 
-Optional:
-    GEMINI_MODEL=gemini-2.5-flash-lite
+Backward compatibility:
+    GEMINI_API_KEY and GEMINI_MODEL are still accepted when LLM_PROVIDER=gemini.
 
 Important:
 - 429/rate-limit/quota errors are raised immediately and are NOT retried.
-- Other temporary errors retry at most once.
-- JSON output is requested with response_mime_type="application/json".
+- Other temporary errors retry at most once by default.
+- All providers return the same dictionary shape to the rest of the project.
 """
 
 import json
 import os
 import time
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
 
-ROOT_DIR = Path(__file__).resolve().parent
-load_dotenv(ROOT_DIR / ".env")
-
-DEFAULT_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.5-flash-lite",
-)
+# The launcher starts from the project root, so this loads the local .env.
+load_dotenv()
 
 
-class LLMProvider:
-    def classify_turn(
-        self,
-        question: str,
-        answer: str,
-        feedback: str = "",
-        previous_question: str = "",
-        previous_answer: str = "",
-        previous_feedback: str = "",
-    ) -> Dict[str, Any]:
-        raise NotImplementedError
+# -----------------------------------------------------------------------------
+# Shared prompts: research/classification logic is provider-independent.
+# -----------------------------------------------------------------------------
 
-
-
-    def classify_completion_delivery(
-        self,
-        transcript: str,
-    ) -> Dict[str, Any]:
-        raise NotImplementedError
-
-
-
-class GeminiProvider(LLMProvider):
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        max_retries: int = 2,
-    ):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        self.model = model or DEFAULT_MODEL
-        self.max_retries = max_retries
-
-        if not self.api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY was not found. "
-                "Create a .env file containing:\n"
-                "GEMINI_API_KEY=your_key_here"
-            )
-
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError as exc:
-            raise RuntimeError(
-                "google-genai is not installed. Run: pip install -r requirements.txt"
-            ) from exc
-
-        self._types = types
-        self.client = genai.Client(api_key=self.api_key)
-
-    def _is_rate_limit_error(self, exc: Exception) -> bool:
-        text = str(exc).lower()
-        status = getattr(exc, "status_code", None)
-
-        return (
-            status == 429
-            or "429" in text
-            or "rate limit" in text
-            or "too many requests" in text
-            or "requests per day" in text
-            or "requests per minute" in text
-            or "tokens per day" in text
-            or "tokens per minute" in text
-            or "resource_exhausted" in text
-            or "quota exceeded" in text
-            or ("quota" in text and "exceed" in text)
-        )
-
-    def _strip_code_fences(self, text: str) -> str:
-        text = (text or "").strip()
-        if text.startswith("```"):
-            text = text.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
-        return text
-
-    def _fallback_json_call(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> Dict[str, Any]:
-        """Fallback without JSON MIME mode, then parse the returned text ourselves."""
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=user_prompt,
-            config=self._types.GenerateContentConfig(
-                system_instruction=(
-                    system_prompt
-                    + "\nReturn ONLY one valid JSON object. "
-                      "Do not use markdown, code fences, commentary, or extra text."
-                ),
-                temperature=0.0,
-            ),
-        )
-
-        response_text = self._strip_code_fences(response.text or "")
-        if not response_text:
-            raise ValueError("Gemini fallback returned an empty response.")
-
-        result = json.loads(response_text)
-        result["_meta"] = {
-            "source": "gemini_llm",
-            "model": self.model,
-        }
-        return result
-
-    def _call_json(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float = 0.0,
-    ) -> Dict[str, Any]:
-        last_error = None
-
-        for attempt in range(self.max_retries):
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=user_prompt,
-                    config=self._types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        temperature=temperature,
-                        response_mime_type="application/json",
-                    ),
-                )
-
-                response_text = response.text or ""
-                if not response_text:
-                    raise ValueError("Gemini returned an empty response.")
-
-                result = json.loads(response_text)
-                result["_meta"] = {
-                    "source": "gemini_llm",
-                    "model": self.model,
-                }
-                return result
-
-            except Exception as exc:
-                last_error = exc
-
-                # Checkpoint-safe behaviour: do not repeatedly retry quota/rate-limit errors.
-                if self._is_rate_limit_error(exc):
-                    raise
-
-                error_text = str(exc).lower()
-
-                # If JSON mode or JSON parsing is the problem, try once without
-                # strict JSON MIME mode, while still asking for JSON only.
-                if (
-                    "json" in error_text
-                    or "response_mime_type" in error_text
-                    or "response schema" in error_text
-                ):
-                    try:
-                        return self._fallback_json_call(
-                            system_prompt=system_prompt,
-                            user_prompt=user_prompt,
-                        )
-                    except Exception as fallback_exc:
-                        if self._is_rate_limit_error(fallback_exc):
-                            raise
-                        last_error = fallback_exc
-
-                if attempt < self.max_retries - 1:
-                    time.sleep(1.5)
-
-        raise RuntimeError(
-            f"Gemini classification failed after {self.max_retries} attempts: "
-            f"{last_error}"
-        )
-
-    def classify_turn(
-        self,
-        question: str,
-        answer: str,
-        feedback: str = "",
-        previous_question: str = "",
-        previous_answer: str = "",
-        previous_feedback: str = "",
-    ) -> Dict[str, Any]:
-        """Classify only the semantic fields required by instructor Q2a/Q3/Q3a/Q4."""
-
-        system_prompt = r"""
+TURN_SYSTEM_PROMPT = r"""
 You are a research-data annotator for a higher-education conversational assessment.
 Classify ONE student answer turn. Keep the four judgements separate and use only the
 evidence specified for each judgement.
@@ -286,6 +109,96 @@ Use a brief reason only for NON_SERIOUS, INCORRECT, PARTIALLY_CORRECT, UNCLEAR, 
 case that genuinely needs review/explanation.
 """
 
+
+COMPLETION_SYSTEM_PROMPT = """
+You are validating completion-code delivery in a higher-education conversational assessment.
+
+Review the session transcript carefully. The student may discuss programming code, so do NOT
+confuse programming/code examples with the assessment completion/access code.
+
+Determine only from explicit transcript evidence whether the assistant actually provided the
+assessment completion/access code. A promise to provide it later, saying the student qualifies,
+or discussing the code without giving its literal value does NOT count as received.
+
+If a completion/access code is explicitly supplied, copy the literal code exactly as shown.
+Do not invent, normalize, or guess a code. If no literal code is present, completion_code must be null.
+
+Return valid JSON only.
+"""
+
+
+class LLMProvider:
+    """Provider-independent interface used by the rest of the project."""
+
+    source_name = "llm"
+
+    def __init__(self, model: str, max_retries: int = 2):
+        if not model:
+            raise RuntimeError(
+                "LLM_MODEL was not found. Add LLM_MODEL=<model-name> to your .env file."
+            )
+        self.model = model
+        self.max_retries = max_retries
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        status = getattr(exc, "status_code", None)
+        response = getattr(exc, "response", None)
+        if status is None and response is not None:
+            status = getattr(response, "status_code", None)
+
+        return (
+            status == 429
+            or "429" in text
+            or "rate limit" in text
+            or "too many requests" in text
+            or "requests per day" in text
+            or "requests per minute" in text
+            or "tokens per day" in text
+            or "tokens per minute" in text
+            or "resource_exhausted" in text
+            or "quota exceeded" in text
+            or ("quota" in text and "exceed" in text)
+        )
+
+    @staticmethod
+    def _strip_code_fences(text: str) -> str:
+        text = (text or "").strip()
+        if text.startswith("```"):
+            text = (
+                text.replace("```json", "")
+                .replace("```JSON", "")
+                .replace("```", "")
+                .strip()
+            )
+        return text
+
+    def _attach_meta(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        result["_meta"] = {
+            "source": self.source_name,
+            "model": self.model,
+        }
+        return result
+
+    def _call_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def classify_turn(
+        self,
+        question: str,
+        answer: str,
+        feedback: str = "",
+        previous_question: str = "",
+        previous_answer: str = "",
+        previous_feedback: str = "",
+    ) -> Dict[str, Any]:
+        """Classify only the semantic fields required by instructor Q2a/Q3/Q3a/Q4."""
+
         user_prompt = f"""
 PREVIOUS TURN (for follow-up determination only):
 Previous question: {previous_question}
@@ -312,34 +225,10 @@ Return exactly this schema:
   }}
 }}
 """
-        return self._call_json(system_prompt, user_prompt)
+        return self._call_json(TURN_SYSTEM_PROMPT, user_prompt)
 
-
-
-    def classify_completion_delivery(
-        self,
-        transcript: str,
-    ) -> Dict[str, Any]:
-        """
-        Independently audit whether a completion code was actually delivered in
-        a session and extract the literal code when the transcript supports it.
-        """
-
-        system_prompt = """
-You are validating completion-code delivery in a higher-education conversational assessment.
-
-Review the session transcript carefully. The student may discuss programming code, so do NOT
-confuse programming/code examples with the assessment completion/access code.
-
-Determine only from explicit transcript evidence whether the assistant actually provided the
-assessment completion/access code. A promise to provide it later, saying the student qualifies,
-or discussing the code without giving its literal value does NOT count as received.
-
-If a completion/access code is explicitly supplied, copy the literal code exactly as shown.
-Do not invent, normalize, or guess a code. If no literal code is present, completion_code must be null.
-
-Return valid JSON only.
-"""
+    def classify_completion_delivery(self, transcript: str) -> Dict[str, Any]:
+        """Audit whether a completion code was actually delivered in a session."""
 
         user_prompt = f"""
 SESSION TRANSCRIPT:
@@ -353,15 +242,334 @@ Return exactly:
   "confidence": 0.0
 }}
 """
-
-        return self._call_json(system_prompt, user_prompt)
-
+        return self._call_json(COMPLETION_SYSTEM_PROMPT, user_prompt)
 
 
-def get_llm_provider() -> Optional[GeminiProvider]:
-    api_key = os.getenv("GEMINI_API_KEY")
+class GeminiProvider(LLMProvider):
+    source_name = "gemini_llm"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        max_retries: int = 2,
+    ):
+        super().__init__(model=model, max_retries=max_retries)
+
+        if not api_key:
+            raise RuntimeError("LLM_API_KEY was not found in .env")
+
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise RuntimeError(
+                "google-genai is not installed. Run: pip install -r requirements.txt"
+            ) from exc
+
+        self._types = types
+        self.client = genai.Client(api_key=api_key)
+
+    def _fallback_json_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> Dict[str, Any]:
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=user_prompt,
+            config=self._types.GenerateContentConfig(
+                system_instruction=(
+                    system_prompt
+                    + "\nReturn ONLY one valid JSON object. "
+                    "Do not use markdown, code fences, commentary, or extra text."
+                ),
+                temperature=0.0,
+            ),
+        )
+
+        response_text = self._strip_code_fences(response.text or "")
+        if not response_text:
+            raise ValueError("Gemini fallback returned an empty response.")
+
+        return self._attach_meta(json.loads(response_text))
+
+    def _call_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+    ) -> Dict[str, Any]:
+        last_error = None
+
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=user_prompt,
+                    config=self._types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        temperature=temperature,
+                        response_mime_type="application/json",
+                    ),
+                )
+
+                response_text = response.text or ""
+                if not response_text:
+                    raise ValueError("Gemini returned an empty response.")
+
+                return self._attach_meta(json.loads(response_text))
+
+            except Exception as exc:
+                last_error = exc
+
+                if self._is_rate_limit_error(exc):
+                    raise
+
+                error_text = str(exc).lower()
+                if (
+                    "json" in error_text
+                    or "response_mime_type" in error_text
+                    or "response schema" in error_text
+                ):
+                    try:
+                        return self._fallback_json_call(system_prompt, user_prompt)
+                    except Exception as fallback_exc:
+                        if self._is_rate_limit_error(fallback_exc):
+                            raise
+                        last_error = fallback_exc
+
+                if attempt < self.max_retries - 1:
+                    time.sleep(1.5)
+
+        raise RuntimeError(
+            f"Gemini classification failed after {self.max_retries} attempts: {last_error}"
+        )
+
+
+class OpenAICompatibleProvider(LLMProvider):
+    """Works with OpenAI and OpenAI-compatible APIs such as Groq and Together."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        provider_name: str = "openai",
+        base_url: Optional[str] = None,
+        max_retries: int = 2,
+    ):
+        super().__init__(model=model, max_retries=max_retries)
+
+        if not api_key:
+            raise RuntimeError("LLM_API_KEY was not found in .env")
+
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "openai is not installed. Run: pip install -r requirements.txt"
+            ) from exc
+
+        self.provider_name = provider_name
+        self.source_name = f"{provider_name}_llm"
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        self.client = OpenAI(**kwargs)
+
+    def _request(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        json_mode: bool,
+    ) -> str:
+        kwargs = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = self.client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content or ""
+
+    def _call_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+    ) -> Dict[str, Any]:
+        last_error = None
+
+        for attempt in range(self.max_retries):
+            try:
+                try:
+                    response_text = self._request(
+                        system_prompt, user_prompt, temperature, json_mode=True
+                    )
+                except Exception as json_mode_exc:
+                    if self._is_rate_limit_error(json_mode_exc):
+                        raise
+                    # Some OpenAI-compatible providers/models do not support response_format.
+                    response_text = self._request(
+                        system_prompt
+                        + "\nReturn ONLY one valid JSON object. No markdown or extra text.",
+                        user_prompt,
+                        temperature,
+                        json_mode=False,
+                    )
+
+                response_text = self._strip_code_fences(response_text)
+                if not response_text:
+                    raise ValueError(f"{self.provider_name} returned an empty response.")
+
+                return self._attach_meta(json.loads(response_text))
+
+            except Exception as exc:
+                last_error = exc
+                if self._is_rate_limit_error(exc):
+                    raise
+                if attempt < self.max_retries - 1:
+                    time.sleep(1.5)
+
+        raise RuntimeError(
+            f"{self.provider_name} classification failed after "
+            f"{self.max_retries} attempts: {last_error}"
+        )
+
+
+class AnthropicProvider(LLMProvider):
+    source_name = "anthropic_llm"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        max_retries: int = 2,
+    ):
+        super().__init__(model=model, max_retries=max_retries)
+
+        if not api_key:
+            raise RuntimeError("LLM_API_KEY was not found in .env")
+
+        try:
+            from anthropic import Anthropic
+        except ImportError as exc:
+            raise RuntimeError(
+                "anthropic is not installed. Run: pip install -r requirements.txt"
+            ) from exc
+
+        self.client = Anthropic(api_key=api_key)
+
+    def _call_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+    ) -> Dict[str, Any]:
+        last_error = None
+
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1200,
+                    temperature=temperature,
+                    system=(
+                        system_prompt
+                        + "\nReturn ONLY one valid JSON object. "
+                        "Do not use markdown, code fences, commentary, or extra text."
+                    ),
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+
+                text_parts = [
+                    block.text
+                    for block in response.content
+                    if getattr(block, "type", None) == "text"
+                ]
+                response_text = self._strip_code_fences("".join(text_parts))
+                if not response_text:
+                    raise ValueError("Anthropic returned an empty response.")
+
+                return self._attach_meta(json.loads(response_text))
+
+            except Exception as exc:
+                last_error = exc
+                if self._is_rate_limit_error(exc):
+                    raise
+                if attempt < self.max_retries - 1:
+                    time.sleep(1.5)
+
+        raise RuntimeError(
+            f"Anthropic classification failed after {self.max_retries} attempts: {last_error}"
+        )
+
+
+_PROVIDER_BASE_URLS = {
+    "groq": "https://api.groq.com/openai/v1",
+    "together": "https://api.together.xyz/v1",
+}
+
+
+def get_llm_provider() -> Optional[LLMProvider]:
+    """
+    Build the configured provider.
+
+    Preferred generic variables:
+        LLM_PROVIDER
+        LLM_API_KEY
+        LLM_MODEL
+        LLM_BASE_URL   (optional)
+
+    For backward compatibility, Gemini can still use:
+        GEMINI_API_KEY
+        GEMINI_MODEL
+    """
+
+    provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+
+    # Backward compatibility with the original Gemini-only .env.
+    if provider == "gemini":
+        api_key = os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
+        model = os.getenv("LLM_MODEL") or os.getenv("GEMINI_MODEL")
+    else:
+        api_key = os.getenv("LLM_API_KEY")
+        model = os.getenv("LLM_MODEL")
 
     if not api_key:
         return None
 
-    return GeminiProvider(api_key=api_key)
+    if not model:
+        raise RuntimeError(
+            "LLM_MODEL was not found. Add LLM_MODEL=<model-name> to your .env file."
+        )
+
+    if provider == "gemini":
+        return GeminiProvider(api_key=api_key, model=model)
+
+    if provider in {"openai", "groq", "together", "openai_compatible"}:
+        base_url = os.getenv("LLM_BASE_URL") or _PROVIDER_BASE_URLS.get(provider)
+        if provider == "openai_compatible" and not base_url:
+            raise RuntimeError(
+                "LLM_BASE_URL is required when LLM_PROVIDER=openai_compatible."
+            )
+        return OpenAICompatibleProvider(
+            api_key=api_key,
+            model=model,
+            provider_name=provider,
+            base_url=base_url,
+        )
+
+    if provider == "anthropic":
+        return AnthropicProvider(api_key=api_key, model=model)
+
+    raise RuntimeError(
+        "Unsupported LLM_PROVIDER. Use one of: "
+        "gemini, openai, groq, together, openai_compatible, anthropic."
+    )
